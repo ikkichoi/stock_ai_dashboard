@@ -34,11 +34,17 @@ def run_ai_pipeline_once():
         # 2. Gemini AI 분석 (API 키 미설정 시 테스트용 기본값 방어)
         if client:
             prompt = f"종목: {company} ({ticker}), 최근 종가: {latest_close}. 투자 심리와 핵심 요약을 JSON({{'score': -100~100 정수, 'opinion': '매수우세/관망/매도우세', 'summary': '한줄요약'}})으로만 답하세요."
-            res = client.models.generate_content(
-                model="gemini-3.8-flash-lite",
-                contents=prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json")
-            )
+available_models = [
+    m.name for m in client.models.list()
+    if "generateContent" in (m.supported_actions or []) and "flash" in m.name.lower()
+]
+target_model = available_models[0] if available_models else "gemini-2.0-flash"
+
+res = client.models.generate_content(
+    model=target_model,
+    contents=prompt,
+    config=types.GenerateContentConfig(response_mime_type="application/json")
+)
             result = json.loads(res.text)
         else:
             result = {"score": 72, "opinion": "매수우세", "summary": f"{company} 최근 종가 {latest_close:,.0f} 기준 견조한 흐름 유지"}
