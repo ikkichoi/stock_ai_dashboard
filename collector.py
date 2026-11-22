@@ -35,7 +35,7 @@ def run_ai_pipeline_once():
         if client:
             prompt = f"종목: {company} ({ticker}), 최근 종가: {latest_close}. 투자 심리와 핵심 요약을 JSON({{'score': -100~100 정수, 'opinion': '매수우세/관망/매도우세', 'summary': '한줄요약'}})으로만 답하세요."
             res = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.8-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
