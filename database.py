@@ -67,6 +67,9 @@ def load_all_history():
     conn.close()
     return df
 
-def load_history():
-    """기존 app.py 호환을 위한 별칭 함수"""
-    return load_all_history()
+def load_history(company=None):
+    """app.py 호환 함수: 특정 종목(company) 또는 전체 분석 이력을 반환합니다."""
+    df = load_all_history()
+    if company and not df.empty:
+        return df[df["company"] == company]
+    return df
