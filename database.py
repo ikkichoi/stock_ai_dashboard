@@ -66,3 +66,7 @@ def load_all_history():
     df = pd.read_sql_query(query, conn)
     conn.close()
     return df
+
+def load_history():
+    """기존 app.py 호환을 위한 별칭 함수"""
+    return load_all_history()
