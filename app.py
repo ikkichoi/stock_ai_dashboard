@@ -37,8 +37,10 @@ else:
     # 시계열 감성점수 추이 차트 (과거 -> 최신순 정렬)
     chart_df = history_df.sort_values("번호")
     fig = go.Figure(go.Scatter(
-        x=chart_df["분석일시"], y=chart_df["감성점수"],
-        mode="lines+markers", name="AI 감성점수",
+        x=chart_df["분석일시"],
+        y=chart_df["감성점수"],
+        mode="lines+markers",
+        name="AI 감성점수",
         line=dict(color="#2ca02c", width=3)
     ))
     fig.update_layout(title=f"{selected_company} 날짜별 AI 감성점수 변화 추이", yaxis_range=[-100, 100], height=350)
