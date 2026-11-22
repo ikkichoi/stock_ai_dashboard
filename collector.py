@@ -45,7 +45,7 @@ res = client.models.generate_content(
     contents=prompt,
     config=types.GenerateContentConfig(response_mime_type="application/json")
 )
-            result = json.loads(res.text)
+result = json.loads(res.text)
         else:
             result = {"score": 72, "opinion": "매수우세", "summary": f"{company} 최근 종가 {latest_close:,.0f} 기준 견조한 흐름 유지"}
 
