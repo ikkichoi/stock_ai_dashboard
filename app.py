@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import streamlit as st
-import plotly.graph_objects as go
-from database import init_db, load_history
+import pandas as pd
+from database import init_db, load_all_history
 from collector import TARGET_STOCKS, run_ai_pipeline_once
 
 init_db()
