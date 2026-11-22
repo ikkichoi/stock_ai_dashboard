@@ -31,23 +31,37 @@ def run_ai_pipeline_once():
             df.columns = df.columns.get_level_values(0)
         latest_close = float(df["Close"].iloc[-1])
 
-        # 2. Gemini AI 분석 (API 키 미설정 시 테스트용 기본값 방어)
-        if client:
+if client:
             prompt = f"종목: {company} ({ticker}), 최근 종가: {latest_close}. 투자 심리와 핵심 요약을 JSON({{'score': -100~100 정수, 'opinion': '매수우세/관망/매도우세', 'summary': '한줄요약'}})으로만 답하세요."
-            available_models = [
+            
+            # 일반 텍스트 생성용 Flash 모델만 필터링 (이미지/오디오/임베딩 전용 제외)
+            candidate_models = [
                 m.name for m in client.models.list()
-                if "generateContent" in (m.supported_actions or []) and "flash" in m.name.lower()
+                if "generateContent" in (m.supported_actions or [])
+                and "flash" in m.name.lower()
+                and not any(x in m.name.lower() for x in ["image", "audio", "tts", "live", "embedding"])
             ]
-            target_model = available_models[0] if available_models else "gemini-2.0-flash"
+            if not candidate_models:
+                candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
-            res = client.models.generate_content(
-                model=target_model,
-                contents=prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json")
-            )
+            res = None
+            last_err = None
+            for model_name in candidate_models:
+                try:
+                    res = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(response_mime_type="application/json")
+                    )
+                    break  # 성공하면 즉시 루프 종료
+                except Exception as e:
+                    last_err = e
+                    continue
+
+            if res is None:
+                raise RuntimeError(f"사용 가능한 모델 호출 모두 실패 (시도 목록: {candidate_models}): {last_err}")
+
             result = json.loads(res.text)
-        else:
-            result = {"score": 72, "opinion": "매수우세", "summary": f"{company} 최근 종가 {latest_close:,.0f} 기준 견조한 흐름 유지"}
 
         # 3. SQLite DB에 자동 적재
         save_analysis(company, ticker, latest_close, result["score"], result["opinion"], result["summary"])
