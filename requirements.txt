@@ -5,3 +5,4 @@ yfinance>=0.2.40
 google-genai>=0.1.1
 apscheduler>=3.10.4
 python-dotenv>=1.0.0
+psycopg2-binary>=2.9.9
