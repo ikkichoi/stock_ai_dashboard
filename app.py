@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -6,113 +5,164 @@ from database import init_db, load_history, load_latest_snapshot
 from collector import get_target_universe, sync_sp500_universe, run_ai_pipeline_once
 
 init_db()
-st.set_page_config(page_title="AI 주식 500+ 통합 리서치 대시보드", page_icon="🤖", layout="wide")
-
-st.title("🤖 AI 500+ 종목 통합 리서치 & 자동 분석 대시보드")
-st.caption("S&P 500 전 종목 유니버스 기반 업종별 맞춤형 밸류에이션 및 AI 감성·펀더멘털 스코어링")
+st.set_page_config(page_title="AI 주식 500+ 퀀트·펀더멘털 리서치", page_icon="🤖", layout="wide")
 
 universe_df = get_target_universe()
 
+st.title("🤖 AI 주식 500+ 기관급 펀더멘털 리서치 대시보드")
+st.caption(
+    f"현재 커버리지 유니버스: 총 **{len(universe_df)}개 종목** (S&P 500 전 종목 + 한국 대표주) | "
+    "실제 재무 멀티플(PER · EV/EBITDA · FCF Yield) & Bear/Base/Bull 목표주가 자동 산출"
+)
+
+# ================= 사이드바 파이프라인 제어 =================
 with st.sidebar:
-    st.header("⚙️ 500+ 파이프라인 제어")
-    st.info(f"현재 등록된 분석 유니버스: **{len(universe_df)}개 종목**")
+    st.header("⚙️ 500+ 리서치 엔진 제어")
 
     if st.button("🌐 S&P 500 유니버스 동기화 (500+)", width="stretch"):
-        with st.spinner("Wikipedia에서 S&P 500 전 종목 리스트를 가져오는 중..."):
+        with st.spinner("Wikipedia에서 최신 S&P 500 구성종목 동기화 중..."):
             universe_df = sync_sp500_universe()
-        st.success(f"✅ 총 {len(universe_df)}개 종목 동기화 완료!")
+        st.success(f"총 {len(universe_df)}개 종목 동기화 완료!")
         st.rerun()
 
     st.divider()
+    st.subheader("🚀 배치 AI 리서치 실행")
     sectors = ["전체 (All Sectors)"] + sorted(universe_df["sector"].dropna().unique().tolist())
-    selected_sector = st.selectbox("1️⃣ 분석/필터 섹터 선택", sectors)
+    selected_sector = st.selectbox("대상 섹터 필터", sectors)
+    batch_limit = st.slider("1회 실행 종목 수 (API 안전 배치)", min_value=1, max_value=100, value=10)
 
-    if selected_sector != "전체 (All Sectors)":
-        filtered_universe = universe_df[universe_df["sector"] == selected_sector]
-    else:
-        filtered_universe = universe_df
-
-    batch_limit = st.slider(
-        "2️⃣ 1회 일괄 분석 종목 수",
-        min_value=1,
-        max_value=max(1, len(filtered_universe)),
-        value=min(10, len(filtered_universe)),
-        help="웹 화면에서는 타임아웃 방지를 위해 5~20개 단위로 실행하고, 500개 전체는 터미널(python collector.py)로 실행하는 것을 권장합니다."
-    )
-
-    if st.button("🚀 선택 섹터 일괄 AI 분석 실행", type="primary", width="stretch"):
+    if st.button("▶️ 선택 섹터 AI 분석 실행", type="primary", width="stretch"):
         prog_bar = st.progress(0)
         status_txt = st.empty()
 
         def update_prog(curr, tot, msg):
-            prog_bar.progress(curr / tot)
+            prog_bar.progress(curr / tot if tot > 0 else 1.0)
             status_txt.text(msg)
 
-        count = run_ai_pipeline_once(
-            limit=batch_limit,
-            target_sector=selected_sector,
-            progress_callback=update_prog
-        )
-        st.success(f"✅ {count}개 종목 AI 분석 및 근거 적재 완료!")
-        st.rerun()
+        try:
+            count = run_ai_pipeline_once(
+                limit=batch_limit,
+                target_sector=selected_sector,
+                progress_callback=update_prog,
+            )
+            st.success(f"{count}개 종목 리서치 완료!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"실행 오류: {e}")
 
     st.divider()
-    company_options = filtered_universe["company"].tolist() if not filtered_universe.empty else universe_df["company"].tolist()
-    selected_company = st.selectbox("3️⃣ 상세 리포트 조회 종목", company_options)
+    st.subheader("🔍 개별 종목 심층 조회 & 즉시 분석")
+    company_options = universe_df["company"].tolist()
+    default_idx = company_options.index("Netflix") if "Netflix" in company_options else 0
+    selected_company = st.selectbox("종목 선택 (검색 가능)", company_options, index=default_idx)
 
-    if st.button("🎯 이 종목만 즉시 단건 분석", width="stretch"):
-        target_ticker = universe_df.loc[universe_df["company"] == selected_company, "ticker"].iloc[0]
-        with st.spinner(f"{selected_company} ({target_ticker}) 심층 분석 중..."):
+    target_row = universe_df[universe_df["company"] == selected_company].iloc[0]
+    target_ticker = target_row["ticker"]
+    target_sector_label = target_row["sector"]
+
+    if st.button(f"⚡ '{selected_company}' 즉시 심층 분석", width="stretch"):
+        with st.spinner(f"{selected_company} ({target_ticker}) 재무 추출 및 AI 목표주가 산출 중..."):
             run_ai_pipeline_once(limit=1, specific_tickers=[target_ticker])
-        st.success("✅ 단건 분석 완료!")
         st.rerun()
 
-tab1, tab2 = st.tabs(["📊 종목별 AI 심층 분석 & 점수 근거", "🏆 500+ 전 종목 AI 스코어 랭킹"])
+# ================= 메인 탭 구성 =================
+tab1, tab2 = st.tabs(["📊 종목별 AI 심층 리포트 & 목표주가", "🏆 500+ 저평가 종목 발굴 & 랭킹"])
 
 with tab1:
     history_df = load_history(selected_company)
 
     if history_df.empty:
-        st.warning(f"아직 **{selected_company}**의 DB 분석 데이터가 없습니다. 왼쪽 사이드바에서 **[🎯 이 종목만 즉시 단건 분석]** 또는 **[🚀 선택 섹터 일괄 AI 분석 실행]**을 눌러보세요!")
+        st.info(
+            f"💡 **[{selected_company} ({target_ticker}) | {target_sector_label}]**의 분석 기록이 아직 없습니다.\n\n"
+            f"왼쪽 사이드바에서 **'⚡ {selected_company} 즉시 심층 분석'** 버튼을 누르시면 실제 재무지표와 목표주가가 즉시 산출됩니다."
+        )
     else:
         latest = history_df.iloc[0]
+        st.subheader(f"📌 {selected_company} ({latest['ticker']}) — {latest['sector']}")
+
+        # 1단: 핵심 투자 지표
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("최근 분석 종가", f"{float(latest['close_price']):,.2f}")
-        c2.metric("최신 AI 스코어", f"{latest['score']} 점")
-        c3.metric("투자의견", str(latest["opinion"]))
-        c4.metric("핵심 밸류에이션 지표", str(latest.get("valuation_metric") or "-"))
-        c5.metric("마지막 업데이트", str(latest["created_at"])[:16])
+        c1.metric("최근 종가", f"{latest['close_price']:,.2f}")
+        c2.metric("AI 투자 스코어", f"{latest['score']} / 100")
+        c3.metric("투자의견", latest["opinion"])
+        upside = latest.get("upside_pct")
+        c4.metric("Base 상승 여력", f"{upside:+.1f}%" if pd.notna(upside) else "N/A")
+        c5.metric("업데이트 시각", str(latest["updated_at"])[:16])
 
-        # 핵심 요약 및 점수 산출 근거 상세 박스
-        st.subheader("🧠 AI 점수 산출 근거 및 리서치 코멘트")
-        st.info(f"**[한줄 핵심 요약]** {latest.get('summary', '')}")
+        # 2단: 실제 재무 팩트 & Bear / Base / Bull 적정주가 시나리오
+        st.markdown("#### 📐 실제 재무 멀티플 & 12개월 적정주가 시나리오")
+        f1, f2, f3, f4, f5, f6, f7 = st.columns(7)
+        f1.metric("시가총액", latest.get("market_cap") or "N/A")
+        f2.metric("PER", f"{latest['per']:.1f}x" if pd.notna(latest.get("per")) else "N/A")
+        f3.metric("EV/EBITDA", f"{latest['ev_ebitda']:.1f}x" if pd.notna(latest.get("ev_ebitda")) else "N/A")
+        f4.metric("FCF Yield", f"{latest['fcf_yield']:.1f}%" if pd.notna(latest.get("fcf_yield")) else "N/A")
+        f5.metric("🐻 Bear 목표가", f"{latest['bear_target']:,.2f}" if pd.notna(latest.get("bear_target")) else "N/A")
+        f6.metric("🎯 Base 목표가", f"{latest['base_target']:,.2f}" if pd.notna(latest.get("base_target")) else "N/A")
+        f7.metric("🐂 Bull 목표가", f"{latest['bull_target']:,.2f}" if pd.notna(latest.get("bull_target")) else "N/A")
+
+        # 3단: AI 애널리스트 산출 근거 박스
         with st.container(border=True):
-            st.markdown(f"**📌 왜 {latest['score']}점({latest['opinion']})이 나왔는가?**")
-            reasoning_text = latest.get("reasoning") or "상세 근거가 기록되지 않은 이전 버전 데이터입니다. 재분석을 실행하면 상세 근거가 표시됩니다."
-            st.write(reasoning_text)
+            st.markdown(f"**🎯 적용 핵심 밸류에이션:** `{latest.get('valuation_metric', 'N/A')}`")
+            st.markdown(f"**💡 한 줄 요약:** {latest['summary']}")
+            st.markdown("**🧠 AI 애널리스트 스코어 산출 근거:**")
+            st.write(latest.get("reasoning") or "상세 근거가 기록되지 않았습니다.")
 
-        st.divider()
+        # 4단: 누적 시계열 차트
         chart_df = history_df.sort_values("id")
-        fig = go.Figure(go.Scatter(
-            x=chart_df["created_at"],
-            y=chart_df["score"],
-            mode="lines+markers",
-            name="AI 스코어",
-            line=dict(color="#2ca02c", width=3)
-        ))
-        fig.update_layout(title=f"{selected_company} 날짜별 AI 스코어 변화 추이", yaxis_range=[-100, 100], height=320)
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(x=chart_df["updated_at"], y=chart_df["close_price"], name="종가", mode="lines+markers")
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=chart_df["updated_at"],
+                y=chart_df["score"],
+                name="AI 스코어",
+                yaxis="y2",
+                mode="lines+markers",
+                line=dict(dash="dot"),
+            )
+        )
+        fig.update_layout(
+            title="누적 주가 vs AI 스코어 추이",
+            yaxis=dict(title="주가"),
+            yaxis2=dict(title="AI 스코어", overlaying="y", side="right", range=[0, 100]),
+            hovermode="x unified",
+        )
         st.plotly_chart(fig, width="stretch")
 
-        st.subheader("📜 DB 누적 분석 히스토리")
-        display_cols = [c for c in ["id", "created_at", "company", "ticker", "sector", "close_price", "score", "opinion", "valuation_metric", "summary", "reasoning"] if c in history_df.columns]
-        st.dataframe(history_df[display_cols], width="stretch", hide_index=True)
-
 with tab2:
-    st.subheader("🏆 DB 적재 전 종목 최신 AI 스코어 순위")
+    st.subheader("🏆 500+ 유니버스 최신 AI 애널리스트 스코어 & 저평가 랭킹")
     snap_df = load_latest_snapshot()
+
     if snap_df.empty:
-        st.info("아직 분석된 종목이 없습니다. 사이드바에서 일괄 분석을 실행해 보세요.")
+        st.warning("아직 학습·분석된 종목 데이터가 없습니다. 왼쪽 사이드바에서 AI 분석을 실행해 주세요.")
     else:
-        st.caption(f"현재 총 **{len(snap_df)}개** 종목의 최신 AI 분석 리포트가 DB에 적재되어 있습니다.")
-        show_cols = [c for c in ["score", "opinion", "company", "ticker", "sector", "close_price", "valuation_metric", "summary", "reasoning", "created_at"] if c in snap_df.columns]
-        st.dataframe(snap_df[show_cols], width="stretch", hide_index=True)
+        # 알짜 저평가 필터 컨트롤
+        fc1, fc2, fc3 = st.columns([2, 2, 1])
+        min_score = fc1.slider("최소 AI 스코어 필터", 0, 100, 0)
+        min_upside = fc2.slider("최소 Base 상승 여력(%) 필터", -50, 100, -50)
+
+        filtered_df = snap_df[
+            (snap_df["score"] >= min_score)
+            & (snap_df["upside_pct"].fillna(-999) >= min_upside)
+        ].copy()
+
+        csv_bytes = filtered_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        fc3.markdown("<br>", unsafe_allow_html=True)
+        fc3.download_button(
+            label="📥 CSV 리포트 다운로드",
+            data=csv_bytes,
+            file_name="ai_sp500_research_report.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+        st.write(f"필터링된 종목 수: **{len(filtered_df)}개** / 전체 학습 완료: **{len(snap_df)}개**")
+        show_cols = [
+            "company", "ticker", "sector", "market_cap", "close_price",
+            "base_target", "upside_pct", "score", "opinion",
+            "per", "ev_ebitda", "fcf_yield", "valuation_metric", "reasoning",
+        ]
+        existing_show_cols = [c for c in show_cols if c in filtered_df.columns]
+        st.dataframe(filtered_df[existing_show_cols], width="stretch", hide_index=True)

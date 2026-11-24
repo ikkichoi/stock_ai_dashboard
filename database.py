@@ -1,18 +1,18 @@
-# -*- coding: utf-8 -*-
 import os
 import sqlite3
-from datetime import datetime
 import pandas as pd
 
 DB_PATH = os.getenv("DB_PATH", "stock_analysis.db")
 
+
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
+
 
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
-    # 1. 분석 히스토리 테이블
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS analysis_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -22,79 +22,128 @@ def init_db():
             close_price REAL,
             score INTEGER,
             opinion TEXT,
+            valuation_metric TEXT DEFAULT '',
             summary TEXT,
-            reasoning TEXT,
-            valuation_metric TEXT,
-            created_at TEXT
+            reasoning TEXT DEFAULT '',
+            market_cap TEXT DEFAULT 'N/A',
+            per REAL,
+            ev_ebitda REAL,
+            fcf_yield REAL,
+            bear_target REAL,
+            base_target REAL,
+            bull_target REAL,
+            upside_pct REAL,
+            updated_at TEXT
         )
     """)
-    # 기존 DB 테이블 마이그레이션 (컬럼 누락 시 자동 추가)
-    cur.execute("PRAGMA table_info(analysis_history)")
-    existing_cols = {row[1] for row in cur.fetchall()}
-    for col, col_type in [
-        ("sector", "TEXT DEFAULT 'Unknown'"),
-        ("reasoning", "TEXT DEFAULT ''"),
-        ("valuation_metric", "TEXT DEFAULT ''")
-    ]:
-        if col not in existing_cols:
-            cur.execute(f"ALTER TABLE analysis_history ADD COLUMN {col} {col_type}")
 
-    # 2. 500+ 종목 유니버스 마스터 테이블
     cur.execute("""
         CREATE TABLE IF NOT EXISTS stock_universe (
             ticker TEXT PRIMARY KEY,
             company TEXT NOT NULL,
-            sector TEXT,
-            sub_industry TEXT,
+            sector TEXT DEFAULT 'Unknown',
             updated_at TEXT
         )
     """)
+
+    # 기존 Day 2 / Day 3 DB 호환 자동 마이그레이션
+    cur.execute("PRAGMA table_info(analysis_history)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    new_columns = [
+        ("sector", "TEXT DEFAULT 'Unknown'"),
+        ("reasoning", "TEXT DEFAULT ''"),
+        ("valuation_metric", "TEXT DEFAULT ''"),
+        ("market_cap", "TEXT DEFAULT 'N/A'"),
+        ("per", "REAL"),
+        ("ev_ebitda", "REAL"),
+        ("fcf_yield", "REAL"),
+        ("bear_target", "REAL"),
+        ("base_target", "REAL"),
+        ("bull_target", "REAL"),
+        ("upside_pct", "REAL"),
+    ]
+    for col, col_type in new_columns:
+        if col not in existing_cols:
+            cur.execute(f"ALTER TABLE analysis_history ADD COLUMN {col} {col_type}")
+
     conn.commit()
     conn.close()
 
+
 def save_universe(df: pd.DataFrame):
     conn = get_conn()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur = conn.cursor()
     rows = [
-        (row["ticker"], row["company"], row.get("sector", "Unknown"), row.get("sub_industry", ""), now)
-        for _, row in df.iterrows()
+        (r["ticker"], r["company"], r["sector"], r["updated_at"])
+        for _, r in df.iterrows()
     ]
-    conn.executemany("""
-        INSERT OR REPLACE INTO stock_universe (ticker, company, sector, sub_industry, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+    cur.executemany("""
+        INSERT INTO stock_universe (ticker, company, sector, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(ticker) DO UPDATE SET
+            company=excluded.company,
+            sector=excluded.sector,
+            updated_at=excluded.updated_at
     """, rows)
     conn.commit()
     conn.close()
 
+
 def load_universe() -> pd.DataFrame:
     conn = get_conn()
-    df = pd.read_sql_query("SELECT ticker, company, sector, sub_industry FROM stock_universe ORDER BY sector, company", conn)
+    df = pd.read_sql_query(
+        "SELECT ticker, company, sector, updated_at FROM stock_universe ORDER BY company ASC",
+        conn,
+    )
     conn.close()
     return df
 
-def save_analysis(company, ticker, sector, close_price, score, opinion, summary, reasoning="", valuation_metric=""):
+
+def insert_analysis(row: dict):
     conn = get_conn()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         INSERT INTO analysis_history
-        (company, ticker, sector, close_price, score, opinion, summary, reasoning, valuation_metric, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (company, ticker, sector, close_price, int(score), opinion, summary, reasoning, valuation_metric, now))
+        (company, ticker, sector, close_price, score, opinion, valuation_metric,
+         summary, reasoning, market_cap, per, ev_ebitda, fcf_yield,
+         bear_target, base_target, bull_target, upside_pct, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        row["company"],
+        row["ticker"],
+        row.get("sector", "Unknown"),
+        row["close_price"],
+        row["score"],
+        row["opinion"],
+        row.get("valuation_metric", ""),
+        row["summary"],
+        row.get("reasoning", ""),
+        row.get("market_cap", "N/A"),
+        row.get("per"),
+        row.get("ev_ebitda"),
+        row.get("fcf_yield"),
+        row.get("bear_target"),
+        row.get("base_target"),
+        row.get("bull_target"),
+        row.get("upside_pct"),
+        row["updated_at"],
+    ))
     conn.commit()
     conn.close()
+
 
 def load_history(company: str) -> pd.DataFrame:
     conn = get_conn()
     df = pd.read_sql_query(
         "SELECT * FROM analysis_history WHERE company = ? ORDER BY id DESC",
         conn,
-        params=(company,)
+        params=(company,),
     )
     conn.close()
     return df
 
+
 def load_latest_snapshot() -> pd.DataFrame:
-    """전 종목 최신 분석 1건씩 요약 조회 (스크리닝용)"""
     conn = get_conn()
     df = pd.read_sql_query("""
         SELECT a.*
@@ -104,7 +153,7 @@ def load_latest_snapshot() -> pd.DataFrame:
             FROM analysis_history
             GROUP BY ticker
         ) b ON a.id = b.max_id
-        ORDER BY a.score DESC
+        ORDER BY a.score DESC, a.upside_pct DESC
     """, conn)
     conn.close()
     return df
