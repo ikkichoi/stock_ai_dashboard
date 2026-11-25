@@ -29,6 +29,11 @@ def init_db():
             per REAL,
             ev_ebitda REAL,
             fcf_yield REAL,
+            oe_yield REAL,
+            gaap_opm REAL,
+            net_debt_ebitda REAL,
+            dcf_assumptions TEXT DEFAULT '',
+            normalization_note TEXT DEFAULT '',
             bear_target REAL,
             base_target REAL,
             bull_target REAL,
@@ -46,7 +51,7 @@ def init_db():
         )
     """)
 
-    # 기존 Day 2 / Day 3 DB 호환 자동 마이그레이션
+    # 기존 Day 2~4 DB 호환 자동 마이그레이션
     cur.execute("PRAGMA table_info(analysis_history)")
     existing_cols = {row[1] for row in cur.fetchall()}
     new_columns = [
@@ -57,6 +62,11 @@ def init_db():
         ("per", "REAL"),
         ("ev_ebitda", "REAL"),
         ("fcf_yield", "REAL"),
+        ("oe_yield", "REAL"),
+        ("gaap_opm", "REAL"),
+        ("net_debt_ebitda", "REAL"),
+        ("dcf_assumptions", "TEXT DEFAULT ''"),
+        ("normalization_note", "TEXT DEFAULT ''"),
         ("bear_target", "REAL"),
         ("base_target", "REAL"),
         ("bull_target", "REAL"),
@@ -105,9 +115,10 @@ def insert_analysis(row: dict):
     cur.execute("""
         INSERT INTO analysis_history
         (company, ticker, sector, close_price, score, opinion, valuation_metric,
-         summary, reasoning, market_cap, per, ev_ebitda, fcf_yield,
+         summary, reasoning, market_cap, per, ev_ebitda, fcf_yield, oe_yield,
+         gaap_opm, net_debt_ebitda, dcf_assumptions, normalization_note,
          bear_target, base_target, bull_target, upside_pct, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         row["company"],
         row["ticker"],
@@ -122,6 +133,11 @@ def insert_analysis(row: dict):
         row.get("per"),
         row.get("ev_ebitda"),
         row.get("fcf_yield"),
+        row.get("oe_yield"),
+        row.get("gaap_opm"),
+        row.get("net_debt_ebitda"),
+        row.get("dcf_assumptions", ""),
+        row.get("normalization_note", ""),
         row.get("bear_target"),
         row.get("base_target"),
         row.get("bull_target"),
