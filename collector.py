@@ -12,7 +12,7 @@ from database import init_db, insert_analysis, save_universe, load_universe
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 API_SLEEP_SEC = float(os.getenv("API_SLEEP_SEC", "4.2"))
 
 SYSTEM_ANALYST_PROMPT = """
@@ -212,7 +212,8 @@ def _fetch_fundamentals(ticker: str) -> dict:
             "net_debt_str": "N/A",
             "net_debt_ebitda": None,
         }
-
+    if not GEMINI_API_KEY or not GEMINI_API_KEY.startswith("AIza"):
+        raise ValueError("GEMINI_API_KEY가 설정되지 않았습니다. .env 파일을 확인하세요.")
 
 def run_ai_pipeline_once(
     limit: int = 20,
