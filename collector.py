@@ -64,14 +64,12 @@ SYSTEM_ANALYST_PROMPT = """
 
 
 def _get_candidate_models(client) -> list[str]:
-    """2.5 이하 구형 모델(404)을 제외하고, 3.x 이상 최신 가용 모델만 우선순위대로 반환."""
+    """무료 등급에서 할당량이 넉넉한 3.x Flash / Flash-Lite 계열만 반환 (Pro 제외)."""
     preferred = [
         "gemini-3.8-flash",
         "gemini-3.8-flash-lite",
         "gemini-3.5-flash",
         "gemini-3.0-flash",
-        "gemini-3.8-pro",
-        "gemini-3.5-pro",
     ]
     available = []
     try:
@@ -79,7 +77,7 @@ def _get_candidate_models(client) -> list[str]:
             name = m.name.replace("models/", "")
             if (
                 "generateContent" in (m.supported_actions or [])
-                and any(k in name.lower() for k in ["flash", "pro"])
+                and "flash" in name.lower()
                 and not any(
                     x in name.lower()
                     for x in ["image", "audio", "tts", "live", "embedding", "vision", "1.0", "1.5", "2.0", "2.5"]
@@ -94,8 +92,8 @@ def _get_candidate_models(client) -> list[str]:
         if m not in ordered:
             ordered.append(m)
 
-    return ordered if ordered else ["gemini-3.8-flash", "gemini-3.8-pro"]
-    
+    return ordered if ordered else ["gemini-3.8-flash", "gemini-3.8-flash-lite"]   
+
 def sync_sp500_universe() -> pd.DataFrame:
     """Wikipedia 크롤링 우선 시도 후 실패 시 GitHub 공식 S&P 500 CSV 백업 소스로 100% 동기화."""
     init_db()
@@ -333,50 +331,40 @@ S&P GICS 공식 섹터 분류: {sector}
             res = None
             last_err = None
             for m_try in candidate_models:
-                for attempt in range(3):  # 503 일시 혼잡 시 최대 3회 재시도
+                try:
+                    res = client.models.generate_content(
+                        model=m_try,
+                        contents=user_prompt,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_ANALYST_PROMPT,
+                            tools=[{"google_search": {}}],
+                            temperature=0.2,
+                        ),
+                    )
+                    if res and res.text:
+                        break
+                except Exception as api_e:
+                    last_err = api_e
+                    # Search 할당량/지원 문제 시 일반 모드로 1회 폴백
                     try:
                         res = client.models.generate_content(
                             model=m_try,
                             contents=user_prompt,
                             config=types.GenerateContentConfig(
                                 system_instruction=SYSTEM_ANALYST_PROMPT,
-                                tools=[{"google_search": {}}],
+                                response_mime_type="application/json",
                                 temperature=0.2,
                             ),
                         )
                         if res and res.text:
                             break
-                    except Exception as api_e:
-                        last_err = api_e
-                        err_str = str(api_e)
-                        # google_search 미지원 모델인 경우 일반 모드로 1회 즉시 재시도
-                        if "INVALID_ARGUMENT" in err_str or "Search" in err_str:
-                            try:
-                                res = client.models.generate_content(
-                                    model=m_try,
-                                    contents=user_prompt,
-                                    config=types.GenerateContentConfig(
-                                        system_instruction=SYSTEM_ANALYST_PROMPT,
-                                        response_mime_type="application/json",
-                                        temperature=0.2,
-                                    ),
-                                )
-                                if res and res.text:
-                                    break
-                            except Exception as e2:
-                                last_err = e2
-                                err_str = str(e2)
-
-                        if any(k in err_str for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
-                            time.sleep(3.5 * (attempt + 1))
-                            continue
-                        break
-                if res and res.text:
-                    break
+                    except Exception as e2:
+                        last_err = e2
+                        time.sleep(1.5)
+                        continue
 
             if not res or not res.text:
-                raise last_err or RuntimeError("사용 가능한 모든 Gemini 모델이 현재 혼잡 상태입니다.")
- 
+                raise last_err or RuntimeError("사용 가능한 Flash 모델 할당량이 일시 소진되었습니다.") 
             parsed = _extract_json(res.text)
 
             # 야후 파이낸스가 0.0을 반환했거나 분할 전 주가인 경우 검색된 실제 주가로 보정
