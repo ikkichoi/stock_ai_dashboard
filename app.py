@@ -45,8 +45,11 @@ with st.sidebar:
                 target_sector=selected_sector,
                 progress_callback=update_prog,
             )
-            st.success(f"{count}개 종목 리서치 완료!")
-            st.rerun()
+            if count == 0:
+                st.warning("분석 대상 종목을 찾지 못했습니다. 먼저 'S&P 500 유니버스 동기화'를 실행하세요.")
+            else:
+                st.success(f"{count}개 종목 리서치 완료!")
+                st.rerun()
         except Exception as e:
             st.error(f"실행 오류: {e}")
 
@@ -61,9 +64,17 @@ with st.sidebar:
     target_sector_label = target_row["sector"]
 
     if st.button(f"⚡ '{selected_company}' 즉시 심층 분석", width="stretch"):
-        with st.spinner(f"{selected_company} ({target_ticker}) OE(FCF-SBC) 추출 및 DCF 산출 중..."):
-            run_ai_pipeline_once(limit=1, specific_tickers=[target_ticker])
-        st.rerun()
+        st.write(f"1️⃣ 버튼 클릭됨: {selected_company} ({target_ticker})")
+        try:
+            cnt = run_ai_pipeline_once(limit=1, specific_tickers=[target_ticker])
+            st.write(f"2️⃣ 실행 완료 반환값: {cnt}")
+            if cnt == 0:
+                st.error("⚠️ 반환값이 0입니다. 유니버스 매칭 실패 또는 API 호출 중단!")
+            else:
+                st.success("✅ DB 저장 성공! 새로고침합니다.")
+                st.rerun()
+        except Exception as e:
+            st.exception(e)  # 에러 전체 스택을 화면에 빨간 박스로 강제 출력
 
 # ================= 메인 탭 구성 =================
 tab1, tab2 = st.tabs(["📊 종목별 OE DCF · 재무 정상화 리포트", "🏆 500+ 저평가 종목 발굴 & 랭킹"])

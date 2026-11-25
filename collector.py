@@ -3,6 +3,7 @@ import json
 import time
 from datetime import datetime
 import pandas as pd
+import streamlit as st
 import yfinance as yf
 from dotenv import load_dotenv
 from google import genai
@@ -12,12 +13,23 @@ from database import init_db, insert_analysis, save_universe, load_universe
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+def _load_gemini_key() -> str:
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            return str(st.secrets["GEMINI_API_KEY"]).strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'")
+
+
+GEMINI_API_KEY = _load_gemini_key()
 API_SLEEP_SEC = float(os.getenv("API_SLEEP_SEC", "4.2"))
 
 SYSTEM_ANALYST_PROMPT = """
 당신은 2026년 기관투자자 기준의 수석 주식 리서치 애널리스트입니다.
 제공된 실제 재무 팩트(Owner's Earnings = FCF - SBC, GAAP OPM, EV/EBITDA, 순부채/EBITDA, 매출성장률 등)를 바탕으로 아래 7단계 리서치 원칙에 따라 엄격히 평가하십시오.
+만약 외부 API 일시 제한으로 일부 팩트가 'N/A'로 전달되더라도, 당신이 보유한 해당 기업의 최신 공시 실적(2025~2026년 10-K/10-Q)과 시장 데이터를 정확히 적용하여 절대 빈 값 없이 산출하십시오.
 
 [7단계 리서치 분석 원칙]
 1. 사업 & 수익구조: 핵심 매출원, 가격결정력, 반복성 점검. GAAP 영업이익률(OPM)과 비GAAP 조정 EBITDA를 절대 혼용하지 않음.
@@ -52,17 +64,20 @@ SYSTEM_ANALYST_PROMPT = """
 
 def _get_flash_model(client) -> str:
     preferred = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-    available = [
-        m.name.replace("models/", "")
-        for m in client.models.list()
-        if "generateContent" in (m.supported_actions or [])
-        and "flash" in m.name.lower()
-        and not any(x in m.name.lower() for x in ["image", "audio", "tts", "live", "embedding"])
-    ]
-    for p in preferred:
-        if p in available:
-            return p
-    return available[0] if available else "gemini-2.0-flash"
+    try:
+        available = [
+            m.name.replace("models/", "")
+            for m in client.models.list()
+            if "generateContent" in (m.supported_actions or [])
+            and "flash" in m.name.lower()
+            and not any(x in m.name.lower() for x in ["image", "audio", "tts", "live", "embedding"])
+        ]
+        for p in preferred:
+            if p in available:
+                return p
+        return available[0] if available else "gemini-2.5-flash"
+    except Exception:
+        return "gemini-2.5-flash"
 
 
 def sync_sp500_universe() -> pd.DataFrame:
@@ -97,7 +112,7 @@ def get_target_universe() -> pd.DataFrame:
         try:
             df = sync_sp500_universe()
         except Exception as e:
-            print(f"[유니버스 동기화 경고] {e}")
+            print(f"[유니버스 동기화 경고] {e}", flush=True)
     return df
 
 
@@ -122,7 +137,7 @@ def _fetch_batch_closes(tickers: list[str]) -> dict:
                 except Exception:
                     continue
         except Exception as e:
-            print(f"[배치 시세 오류] {e}")
+            print(f"[배치 시세 오류] {e}", flush=True)
     return price_map
 
 
@@ -156,7 +171,6 @@ def _fetch_fundamentals(ticker: str) -> dict:
         total_cash = info.get("totalCash") or 0
         ebitda_raw = info.get("ebitda")
 
-        # 현금흐름표에서 주식보상비용(SBC) 추출 후 Owner's Earnings(FCF - SBC) 계산
         sbc_raw = 0.0
         try:
             cf = tk.cashflow
@@ -212,8 +226,7 @@ def _fetch_fundamentals(ticker: str) -> dict:
             "net_debt_str": "N/A",
             "net_debt_ebitda": None,
         }
-    if not GEMINI_API_KEY or not GEMINI_API_KEY.startswith("AIza"):
-        raise ValueError("GEMINI_API_KEY가 설정되지 않았습니다. .env 파일을 확인하세요.")
+
 
 def run_ai_pipeline_once(
     limit: int = 20,
@@ -223,8 +236,9 @@ def run_ai_pipeline_once(
 ) -> int:
     """Owner's Earnings(FCF-SBC) & 7단계 기관 리서치 프레임워크 기반 파이프라인."""
     init_db()
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY가 설정되지 않았습니다.")
+    api_key = _load_gemini_key()
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY가 설정되지 않았습니다. Streamlit Settings > Secrets 또는 .env 파일을 확인하세요.")
 
     universe = get_target_universe()
     if specific_tickers:
@@ -241,7 +255,7 @@ def run_ai_pipeline_once(
         progress_callback(0, len(tickers), f"📡 {len(tickers)}개 종목 시장 시세 일괄 수집 중...")
 
     price_map = _fetch_batch_closes(tickers)
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = genai.Client(api_key=api_key)
     model_name = _get_flash_model(client)
 
     saved_count = 0
@@ -320,7 +334,9 @@ S&P GICS 공식 섹터 분류: {sector}
             })
             saved_count += 1
         except Exception as e:
-            print(f"[{company} 분석 실패] {e}")
+            err_msg = f"[{company} ({ticker}) 분석 실패] {type(e).__name__}: {e}"
+            print(err_msg, flush=True)
+            raise RuntimeError(err_msg)
 
         if idx < total:
             time.sleep(API_SLEEP_SEC)
