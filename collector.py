@@ -64,34 +64,33 @@ SYSTEM_ANALYST_PROMPT = """
 
 
 def _get_candidate_models(client) -> list[str]:
-    """503 혼잡 우회를 위해 사용 가능한 모든 텍스트 생성 Flash/Pro 모델 목록을 우선순위대로 반환."""
+    """2.5 이하 구형 모델(404)을 제외하고, 3.x 이상 최신 가용 모델만 우선순위대로 반환."""
     preferred = [
         "gemini-3.8-flash",
+        "gemini-3.8-flash-lite",
         "gemini-3.5-flash",
         "gemini-3.0-flash",
-        "gemini-2.5-flash-lite",
         "gemini-3.8-pro",
         "gemini-3.5-pro",
     ]
     available = []
     try:
-        available = [
-            m.name.replace("models/", "")
-            for m in client.models.list()
-            if "generateContent" in (m.supported_actions or [])
-            and any(k in m.name.lower() for k in ["flash", "pro"])
-            and not any(x in m.name.lower() for x in ["image", "audio", "tts", "live", "embedding", "vision"])
-        ]
+        for m in client.models.list():
+            name = m.name.replace("models/", "")
+            if (
+                "generateContent" in (m.supported_actions or [])
+                and any(k in name.lower() for k in ["flash", "pro"])
+                and not any(x in name.lower() for x in ["image", "audio", "tts", "live", "embedding", "vision", "1.0", "1.5", "2.0", "2.5"])
+            ):
+                available.append(name)
     except Exception:
         pass
 
-    ordered = [p for p in preferred if p in available]
     for m in sorted(available, reverse=True):
         if m not in ordered:
             ordered.append(m)
 
-    return ordered if ordered else preferred
-
+    return ordered if ordered else ["gemini-3.8-flash", "gemini-3.8-pro"]
 
 def sync_sp500_universe() -> pd.DataFrame:
     """Wikipedia 크롤링 우선 시도 후 실패 시 GitHub 공식 S&P 500 CSV 백업 소스로 100% 동기화."""
@@ -256,13 +255,12 @@ def _fetch_fundamentals(ticker: str) -> dict:
 
 def _extract_json(text: str) -> dict:
     cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("\n", 1)[-1]
-        if cleaned.endswith("```"):
-            cleaned = cleaned.rsplit("```", 1)[0]
-    return json.loads(cleaned.strip())
-
-
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        cleaned = cleaned[start:end + 1]
+    return json.loads(cleaned)
+   
 def run_ai_pipeline_once(
     limit: int = 20,
     target_sector: str | None = None,
@@ -331,7 +329,7 @@ S&P GICS 공식 섹터 분류: {sector}
             res = None
             last_err = None
             for m_try in candidate_models:
-                for attempt in range(2):
+                for attempt in range(3):  # 503 일시 혼잡 시 최대 3회 재시도
                     try:
                         res = client.models.generate_content(
                             model=m_try,
@@ -339,7 +337,6 @@ S&P GICS 공식 섹터 분류: {sector}
                             config=types.GenerateContentConfig(
                                 system_instruction=SYSTEM_ANALYST_PROMPT,
                                 tools=[{"google_search": {}}],
-                                response_mime_type="application/json",
                                 temperature=0.2,
                             ),
                         )
@@ -348,7 +345,7 @@ S&P GICS 공식 섹터 분류: {sector}
                     except Exception as api_e:
                         last_err = api_e
                         err_str = str(api_e)
-                        # google_search + response_mime_type 동시 미지원 모델 대비 폴백
+                        # google_search 미지원 모델인 경우 일반 모드로 1회 즉시 재시도
                         if "INVALID_ARGUMENT" in err_str or "Search" in err_str:
                             try:
                                 res = client.models.generate_content(
@@ -364,8 +361,10 @@ S&P GICS 공식 섹터 분류: {sector}
                                     break
                             except Exception as e2:
                                 last_err = e2
+                                err_str = str(e2)
+
                         if any(k in err_str for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
-                            time.sleep(2.5)
+                            time.sleep(3.5 * (attempt + 1))
                             continue
                         break
                 if res and res.text:
@@ -373,7 +372,7 @@ S&P GICS 공식 섹터 분류: {sector}
 
             if not res or not res.text:
                 raise last_err or RuntimeError("사용 가능한 모든 Gemini 모델이 현재 혼잡 상태입니다.")
-
+ 
             parsed = _extract_json(res.text)
 
             # 야후 파이낸스가 0.0을 반환했거나 분할 전 주가인 경우 검색된 실제 주가로 보정
