@@ -28,8 +28,8 @@ API_SLEEP_SEC = float(os.getenv("API_SLEEP_SEC", "4.2"))
 
 SYSTEM_ANALYST_PROMPT = """
 당신은 2026년 기관투자자 기준의 수석 주식 리서치 애널리스트입니다.
-제공된 실제 재무 팩트(Owner's Earnings = FCF - SBC, GAAP OPM, EV/EBITDA, 순부채/EBITDA, 매출성장률 등)를 바탕으로 아래 7단계 리서치 원칙에 따라 엄격히 평가하십시오.
-만약 외부 API 일시 제한으로 일부 팩트가 'N/A'로 전달되더라도, 당신이 보유한 해당 기업의 최신 공시 실적(2025~2026년 10-K/10-Q)과 시장 데이터를 정확히 적용하여 절대 빈 값 없이 산출하십시오.
+제공된 실제 재무 팩트(Owner's Earnings = FCF - SBC, GAAP OPM, EV/EBITDA, 순부채/EBITDA, 매출성장률 등)와 실시간 웹 검색(Google Search)을 바탕으로 아래 7단계 리서치 원칙에 따라 엄격히 평가하십시오.
+특히 액면분할(Stock Split)·병합이 반영된 2026년 현재 실제 거래 주가를 반드시 확인하여 반영하십시오.
 
 [7단계 리서치 분석 원칙]
 1. 사업 & 수익구조: 핵심 매출원, 가격결정력, 반복성 점검. GAAP 영업이익률(OPM)과 비GAAP 조정 EBITDA를 절대 혼용하지 않음.
@@ -44,15 +44,16 @@ SYSTEM_ANALYST_PROMPT = """
 6. 매매 시점 & 안전마진 분리:
    - 단기 주가 급등락만으로 매수 신호를 만들지 않고, '사업 매력도' · '가격 안전마진(Base 괴리율)' · '다음 분기 관찰 지표'를 구분해 판정.
 7. 엄격한 0~100점 스코어링 & Bear/Base/Bull 목표주가:
-   - bear_target <= base_target <= bull_target 순서를 반드시 준수하십시오.
+   - 반드시 액면분할이 모두 반영된 2026년 현재 수정주가(actual_close_price)를 기준으로 bear_target <= base_target <= bull_target 순서를 준수하십시오.
 
 반드시 아래 JSON 스키마로만 응답하십시오:
 {
+  "actual_close_price": 액면분할이 반영된 2026년 현재 실제 주가 숫자(소수점 2자리),
   "score": 0~100 사이 정수,
   "opinion": "강력매수" | "매수" | "중립" | "매도",
   "valuation_metric": "주 평가법 및 핵심 배수 (예: OE DCF [성장 15%/할인 9.5%/g 3.0%] 또는 EV/EBITDA 5.25x)",
   "dcf_assumptions": "시나리오 가정 요약 (예: Bear 10%/10.5%/2.5% | Base 20%/9.5%/3.0% | Bull 25%/9.0%/3.5% 또는 EV/EBITDA 4.5x/5.25x/5.75x)",
-  "normalization_note": "SBC 차감, 순부채/순현금, 일회성 항목, GICS 섹터 분류 등 회계·정상화 주의사항 1줄 요약",
+  "normalization_note": "액면분할 반영 여부, SBC 차감, 순부채/순현금, GICS 섹터 분류 등 회계·정상화 주의사항 1줄 요약",
   "bear_target": 보수적 목표주가 숫자(소수점 2자리),
   "base_target": 기준 목표주가 숫자(소수점 2자리),
   "bull_target": 낙관적 목표주가 숫자(소수점 2자리),
@@ -62,38 +63,61 @@ SYSTEM_ANALYST_PROMPT = """
 """
 
 
-def _get_flash_model(client) -> str:
-    preferred = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.0-flash", "gemini-2.5-flash"]
+def _get_candidate_models(client) -> list[str]:
+    """503 혼잡 우회를 위해 사용 가능한 모든 텍스트 생성 Flash/Pro 모델 목록을 우선순위대로 반환."""
+    preferred = [
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
+        "gemini-3.0-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-3.8-pro",
+        "gemini-3.5-pro",
+    ]
+    available = []
     try:
         available = [
             m.name.replace("models/", "")
             for m in client.models.list()
             if "generateContent" in (m.supported_actions or [])
-            and "flash" in m.name.lower()
-            and not any(x in m.name.lower() for x in ["image", "audio", "tts", "live", "embedding"])
+            and any(k in m.name.lower() for k in ["flash", "pro"])
+            and not any(x in m.name.lower() for x in ["image", "audio", "tts", "live", "embedding", "vision"])
         ]
-        # 최신 버전(숫자 높은 순) 우선 선택
-        for p in preferred:
-            if p in available:
-                return p
-        if available:
-            return sorted(available, reverse=True)[0]
     except Exception:
         pass
-    return "gemini-3.8-flash"
+
+    ordered = [p for p in preferred if p in available]
+    for m in sorted(available, reverse=True):
+        if m not in ordered:
+            ordered.append(m)
+
+    return ordered if ordered else preferred
+
 
 def sync_sp500_universe() -> pd.DataFrame:
-    """Wikipedia에서 최신 S&P 500 전 종목(500+)을 크롤링하고 주요 추가 종목을 병합해 DB에 저장."""
+    """Wikipedia 크롤링 우선 시도 후 실패 시 GitHub 공식 S&P 500 CSV 백업 소스로 100% 동기화."""
     init_db()
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url, storage_options={"User-Agent": "Mozilla/5.0"})
-    raw_df = tables[0]
+    universe_df = pd.DataFrame()
 
-    universe_df = pd.DataFrame({
-        "ticker": raw_df["Symbol"].astype(str).str.strip().str.replace(".", "-", regex=False),
-        "company": raw_df["Security"].astype(str).str.strip(),
-        "sector": raw_df["GICS Sector"].astype(str).str.strip(),
-    })
+    # 1순위: Wikipedia
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        tables = pd.read_html(url, storage_options={"User-Agent": "Mozilla/5.0"})
+        raw_df = tables[0]
+        universe_df = pd.DataFrame({
+            "ticker": raw_df["Symbol"].astype(str).str.strip().str.replace(".", "-", regex=False),
+            "company": raw_df["Security"].astype(str).str.strip(),
+            "sector": raw_df["GICS Sector"].astype(str).str.strip(),
+        })
+    except Exception as e1:
+        print(f"[Wikipedia 동기화 우회 -> 백업 CSV 사용] {e1}", flush=True)
+        # 2순위: GitHub Datasets S&P 500 CSV
+        backup_url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        raw_df = pd.read_csv(backup_url)
+        universe_df = pd.DataFrame({
+            "ticker": raw_df["Symbol"].astype(str).str.strip().str.replace(".", "-", regex=False),
+            "company": raw_df["Security"].astype(str).str.strip(),
+            "sector": raw_df["GICS Sector"].astype(str).str.strip(),
+        })
 
     extra = pd.DataFrame([
         {"ticker": "RDDT", "company": "Reddit", "sector": "Communication Services"},
@@ -119,7 +143,7 @@ def get_target_universe() -> pd.DataFrame:
 
 
 def _fetch_batch_closes(tickers: list[str]) -> dict:
-    """100종목 단위 배치 다운로드로 500+ 종목 최근 종가 및 5일 등락률 고속 수집."""
+    """100종목 단위 배치 다운로드로 최근 종가 및 5일 등락률 수집."""
     price_map = {}
     chunk_size = 100
     for i in range(0, len(tickers), chunk_size):
@@ -230,6 +254,15 @@ def _fetch_fundamentals(ticker: str) -> dict:
         }
 
 
+def _extract_json(text: str) -> dict:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1]
+        if cleaned.endswith("```"):
+            cleaned = cleaned.rsplit("```", 1)[0]
+    return json.loads(cleaned.strip())
+
+
 def run_ai_pipeline_once(
     limit: int = 20,
     target_sector: str | None = None,
@@ -258,7 +291,7 @@ def run_ai_pipeline_once(
 
     price_map = _fetch_batch_closes(tickers)
     client = genai.Client(api_key=api_key)
-    model_name = _get_flash_model(client)
+    candidate_models = _get_candidate_models(client)
 
     saved_count = 0
     total = len(target_df)
@@ -279,9 +312,10 @@ def run_ai_pipeline_once(
         user_prompt = f"""
 분석 대상 기업: {company} (티커: {ticker})
 S&P GICS 공식 섹터 분류: {sector}
-최근 종가: {close_price} (최근 5거래일 등락률: {chg_5d:+.2f}%)
+야후 파이낸스 조회 종가: {close_price} (최근 5거래일 등락률: {chg_5d:+.2f}%)
+※ 반드시 실시간 웹 검색(Google Search)으로 2026년 11월 현재 {ticker}의 액면분할(예: 10:1 분할 등)이 반영된 실제 거래 주가와 최신 10-K/10-Q 재무 수치를 확인한 뒤 목표주가를 계산하세요.
 
-[실제 재무 · 현금흐름 · Owner's Earnings 팩트]
+[야후 파이낸스 보조 재무 팩트]
 - 시가총액: {fund['market_cap']}
 - 보고 FCF (잉여현금흐름): {fund['fcf_str']} (FCF Yield: {f"{fund['fcf_yield']}%" if fund['fcf_yield'] is not None else 'N/A'})
 - 주식보상비용 (SBC): {fund['sbc_str']}
@@ -291,19 +325,63 @@ S&P GICS 공식 섹터 분류: {sector}
 - PER: {fund['per'] if fund['per'] is not None else 'N/A'} | EV/EBITDA: {fund['ev_ebitda'] if fund['ev_ebitda'] is not None else 'N/A'}
 - 순부채 (음수면 순현금): {fund['net_debt_str']} (순부채/EBITDA: {f"{fund['net_debt_ebitda']}x" if fund['net_debt_ebitda'] is not None else 'N/A'})
 
-위 팩트를 바탕으로 OE DCF 또는 업종 대체 멀티플(EV/EBITDA 등)을 선택하여 Bear/Base/Bull 목표주가와 7단계 리서치 근거를 JSON으로 출력하세요.
+위 팩트와 웹 검색 결과를 바탕으로 OE DCF 또는 업종 대체 멀티플(EV/EBITDA 등)을 선택하여 Bear/Base/Bull 목표주가와 7단계 리서치 근거를 JSON으로 출력하세요.
 """
         try:
-            res = client.models.generate_content(
-                model=model_name,
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_ANALYST_PROMPT,
-                    response_mime_type="application/json",
-                    temperature=0.2,
-                ),
-            )
-            parsed = json.loads(res.text)
+            res = None
+            last_err = None
+            for m_try in candidate_models:
+                for attempt in range(2):
+                    try:
+                        res = client.models.generate_content(
+                            model=m_try,
+                            contents=user_prompt,
+                            config=types.GenerateContentConfig(
+                                system_instruction=SYSTEM_ANALYST_PROMPT,
+                                tools=[{"google_search": {}}],
+                                response_mime_type="application/json",
+                                temperature=0.2,
+                            ),
+                        )
+                        if res and res.text:
+                            break
+                    except Exception as api_e:
+                        last_err = api_e
+                        err_str = str(api_e)
+                        # google_search + response_mime_type 동시 미지원 모델 대비 폴백
+                        if "INVALID_ARGUMENT" in err_str or "Search" in err_str:
+                            try:
+                                res = client.models.generate_content(
+                                    model=m_try,
+                                    contents=user_prompt,
+                                    config=types.GenerateContentConfig(
+                                        system_instruction=SYSTEM_ANALYST_PROMPT,
+                                        response_mime_type="application/json",
+                                        temperature=0.2,
+                                    ),
+                                )
+                                if res and res.text:
+                                    break
+                            except Exception as e2:
+                                last_err = e2
+                        if any(k in err_str for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
+                            time.sleep(2.5)
+                            continue
+                        break
+                if res and res.text:
+                    break
+
+            if not res or not res.text:
+                raise last_err or RuntimeError("사용 가능한 모든 Gemini 모델이 현재 혼잡 상태입니다.")
+
+            parsed = _extract_json(res.text)
+
+            # 야후 파이낸스가 0.0을 반환했거나 분할 전 주가인 경우 검색된 실제 주가로 보정
+            searched_price = parsed.get("actual_close_price")
+            if isinstance(searched_price, (int, float)) and searched_price > 0:
+                if close_price <= 0 or abs(close_price - searched_price) / searched_price > 0.5:
+                    close_price = round(float(searched_price), 2)
+
             bear_t = float(parsed.get("bear_target") or round(close_price * 0.85, 2))
             base_t = float(parsed.get("base_target") or round(close_price * 1.10, 2))
             bull_t = float(parsed.get("bull_target") or round(close_price * 1.30, 2))

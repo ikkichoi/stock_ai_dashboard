@@ -20,11 +20,14 @@ with st.sidebar:
     st.header("⚙️ 500+ 리서치 엔진 제어")
 
     if st.button("🌐 S&P 500 유니버스 동기화 (500+)", width="stretch"):
-        with st.spinner("Wikipedia에서 최신 S&P 500 구성종목 동기화 중..."):
-            universe_df = sync_sp500_universe()
-        st.success(f"총 {len(universe_df)}개 종목 동기화 완료!")
-        st.rerun()
-
+        with st.spinner("S&P 500 구성종목(500+) 동기화 중..."):
+            try:
+                universe_df = sync_sp500_universe()
+                st.success(f"총 {len(universe_df)}개 종목 동기화 완료!")
+                st.rerun()
+            except Exception as e:
+                st.exception(e)
+                
     st.divider()
     st.subheader("🚀 배치 AI 리서치 실행")
     sectors = ["전체 (All Sectors)"] + sorted(universe_df["sector"].dropna().unique().tolist())
