@@ -187,7 +187,18 @@ def _fetch_fundamentals(ticker: str) -> dict:
     try:
         tk = yf.Ticker(ticker)
         info = tk.info or {}
+        # 1순위: info의 실제 시장가 / 전일종가
+        price_raw = (
+            info.get("currentPrice")
+            or info.get("regularMarketPrice")
+            or info.get("previousClose")
+        )
+        shares_raw = info.get("sharesOutstanding")
+        # 2순위: 시가총액 / 발행주식수 역산 (액면분할 100% 반영)
+        if not isinstance(price_raw, (int, float)) and isinstance(mcap_raw, (int, float)) and isinstance(shares_raw, (int, float)) and shares_raw > 0:
+            price_raw = mcap_raw / shares_raw
 
+        current_price = round(float(price_raw), 2) if isinstance(price_raw, (int, float)) and price_raw > 0 else 0.0
         mcap_raw = info.get("marketCap")
         per_raw = info.get("trailingPE") or info.get("forwardPE")
         ev_ebitda_raw = info.get("enterpriseToEbitda")
@@ -237,6 +248,7 @@ def _fetch_fundamentals(ticker: str) -> dict:
             "rev_growth_pct": round(float(rev_growth) * 100, 1) if isinstance(rev_growth, (int, float)) else None,
             "net_debt_str": _format_money(net_debt),
             "net_debt_ebitda": net_debt_ebitda,
+            "current_price": current_price,
         }
     except Exception:
         return {
@@ -252,6 +264,7 @@ def _fetch_fundamentals(ticker: str) -> dict:
             "rev_growth_pct": None,
             "net_debt_str": "N/A",
             "net_debt_ebitda": None,
+            "current_price": 0.0,
         }
 
 
@@ -308,13 +321,16 @@ def run_ai_pipeline_once(
         close_price = p_info["close"]
         chg_5d = p_info["chg_5d"]
         fund = _fetch_fundamentals(ticker)
+        if close_price <= 0 and fund.get("current_price", 0.0) > 0:
+            close_price = fund["current_price"]
 
         user_prompt = f"""
 분석 대상 기업: {company} (티커: {ticker})
 S&P GICS 공식 섹터 분류: {sector}
 야후 파이낸스 조회 종가: {close_price} (최근 5거래일 등락률: {chg_5d:+.2f}%)
 ※ 반드시 실시간 웹 검색(Google Search)으로 2026년 11월 현재 {ticker}의 액면분할(예: 10:1 분할 등)이 반영된 실제 거래 주가와 최신 10-K/10-Q 재무 수치를 확인한 뒤 목표주가를 계산하세요.
-
+최근 종가 (액면분할 반영 실제 시장가): ${close_price} (최근 5거래일 등락률: {chg_5d:+.2f}%)
+※ 중요: 현재 실제 주가는 반드시 ${close_price}입니다. 시가총액({fund['market_cap']})과 현재 주가(${close_price})를 기준으로 Bear/Base/Bull 목표주가를 산출하세요. 과거 액면분할 전 주가(예: 800달러대)를 절대 사용하지 마십시오.
 [야후 파이낸스 보조 재무 팩트]
 - 시가총액: {fund['market_cap']}
 - 보고 FCF (잉여현금흐름): {fund['fcf_str']} (FCF Yield: {f"{fund['fcf_yield']}%" if fund['fcf_yield'] is not None else 'N/A'})
@@ -376,6 +392,12 @@ S&P GICS 공식 섹터 분류: {sector}
             bear_t = float(parsed.get("bear_target") or round(close_price * 0.85, 2))
             base_t = float(parsed.get("base_target") or round(close_price * 1.10, 2))
             bull_t = float(parsed.get("bull_target") or round(close_price * 1.30, 2))
+            if close_price > 0 and base_t > close_price * 4:
+                ratio = round(base_t / close_price)
+                if ratio >= 5:
+                    bear_t = round(bear_t / ratio, 2)
+                    base_t = round(base_t / ratio, 2)
+                    bull_t = round(bull_t / ratio, 2)
             upside_pct = round(((base_t - close_price) / close_price * 100), 2) if close_price > 0 else 0.0
 
             insert_analysis({
