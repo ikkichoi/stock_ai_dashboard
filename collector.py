@@ -80,18 +80,22 @@ def _get_candidate_models(client) -> list[str]:
             if (
                 "generateContent" in (m.supported_actions or [])
                 and any(k in name.lower() for k in ["flash", "pro"])
-                and not any(x in name.lower() for x in ["image", "audio", "tts", "live", "embedding", "vision", "1.0", "1.5", "2.0", "2.5"])
+                and not any(
+                    x in name.lower()
+                    for x in ["image", "audio", "tts", "live", "embedding", "vision", "1.0", "1.5", "2.0", "2.5"]
+                )
             ):
                 available.append(name)
     except Exception:
         pass
 
+    ordered = [p for p in preferred if p in available]
     for m in sorted(available, reverse=True):
         if m not in ordered:
             ordered.append(m)
 
     return ordered if ordered else ["gemini-3.8-flash", "gemini-3.8-pro"]
-
+    
 def sync_sp500_universe() -> pd.DataFrame:
     """Wikipedia 크롤링 우선 시도 후 실패 시 GitHub 공식 S&P 500 CSV 백업 소스로 100% 동기화."""
     init_db()
