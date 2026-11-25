@@ -63,7 +63,7 @@ SYSTEM_ANALYST_PROMPT = """
 
 
 def _get_flash_model(client) -> str:
-    preferred = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    preferred = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.0-flash", "gemini-2.5-flash"]
     try:
         available = [
             m.name.replace("models/", "")
@@ -72,13 +72,15 @@ def _get_flash_model(client) -> str:
             and "flash" in m.name.lower()
             and not any(x in m.name.lower() for x in ["image", "audio", "tts", "live", "embedding"])
         ]
+        # 최신 버전(숫자 높은 순) 우선 선택
         for p in preferred:
             if p in available:
                 return p
-        return available[0] if available else "gemini-2.5-flash"
+        if available:
+            return sorted(available, reverse=True)[0]
     except Exception:
-        return "gemini-2.5-flash"
-
+        pass
+    return "gemini-3.8-flash"
 
 def sync_sp500_universe() -> pd.DataFrame:
     """Wikipedia에서 최신 S&P 500 전 종목(500+)을 크롤링하고 주요 추가 종목을 병합해 DB에 저장."""
