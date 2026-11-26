@@ -1,6 +1,9 @@
 import os
+import io
+import re
 import json
 import time
+import urllib.request
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -29,7 +32,7 @@ API_SLEEP_SEC = float(os.getenv("API_SLEEP_SEC", "4.2"))
 SYSTEM_ANALYST_PROMPT = """
 당신은 2026년 기관투자자 기준의 수석 주식 리서치 애널리스트입니다.
 제공된 실제 재무 팩트(Owner's Earnings = FCF - SBC, GAAP OPM, EV/EBITDA, 순부채/EBITDA, 매출성장률 등)와 실시간 웹 검색(Google Search)을 바탕으로 아래 7단계 리서치 원칙에 따라 엄격히 평가하십시오.
-특히 액면분할(Stock Split)·병합이 반영된 2026년 현재 실제 거래 주가를 반드시 확인하여 반영하십시오.
+특히 액면분할(Stock Split)·병합이 반영된 2026년 현재 실제 거래 주가를 반드시 기준으로 삼아 목표주가를 산출하십시오.
 
 [7단계 리서치 분석 원칙]
 1. 사업 & 수익구조: 핵심 매출원, 가격결정력, 반복성 점검. GAAP 영업이익률(OPM)과 비GAAP 조정 EBITDA를 절대 혼용하지 않음.
@@ -44,12 +47,12 @@ SYSTEM_ANALYST_PROMPT = """
 6. 매매 시점 & 안전마진 분리:
    - 단기 주가 급등락만으로 매수 신호를 만들지 않고, '사업 매력도' · '가격 안전마진(Base 괴리율)' · '다음 분기 관찰 지표'를 구분해 판정.
 7. 엄격한 0~100점 스코어링 & Bear/Base/Bull 목표주가:
-   - 반드시 액면분할이 모두 반영된 2026년 현재 수정주가(actual_close_price)를 기준으로 bear_target <= base_target <= bull_target 순서를 준수하십시오.
+   - 반드시 제공된 액면분할 반영 현재 실제 주가(actual_close_price)를 기준으로 bear_target <= base_target <= bull_target 순서를 준수하십시오. 과거 분할 전 주가 스케일을 절대 사용하지 마십시오.
 
 반드시 아래 JSON 스키마로만 응답하십시오:
 {
   "actual_close_price": 액면분할이 반영된 2026년 현재 실제 주가 숫자(소수점 2자리),
-  "score": 0~100 사이 정수,
+  "score": 1~100 사이 정수,
   "opinion": "강력매수" | "매수" | "중립" | "매도",
   "valuation_metric": "주 평가법 및 핵심 배수 (예: OE DCF [성장 15%/할인 9.5%/g 3.0%] 또는 EV/EBITDA 5.25x)",
   "dcf_assumptions": "시나리오 가정 요약 (예: Bear 10%/10.5%/2.5% | Base 20%/9.5%/3.0% | Bull 25%/9.0%/3.5% 또는 EV/EBITDA 4.5x/5.25x/5.75x)",
@@ -64,7 +67,7 @@ SYSTEM_ANALYST_PROMPT = """
 
 
 def _get_candidate_models(client) -> list[str]:
-    """무료 등급에서 할당량이 넉넉한 3.x Flash / Flash-Lite 계열만 반환 (Pro 제외)."""
+    """무료 등급에서 할당량이 넉넉한 3.x Flash / Flash-Lite 계열만 반환 (2.5 이하 구형 및 Pro 제외)."""
     preferred = [
         "gemini-3.8-flash",
         "gemini-3.8-flash-lite",
@@ -92,14 +95,14 @@ def _get_candidate_models(client) -> list[str]:
         if m not in ordered:
             ordered.append(m)
 
-    return ordered if ordered else ["gemini-3.8-flash", "gemini-3.8-flash-lite"]   
+    return ordered if ordered else ["gemini-3.8-flash", "gemini-3.8-flash-lite"]
+
 
 def sync_sp500_universe() -> pd.DataFrame:
     """Wikipedia 크롤링 우선 시도 후 실패 시 GitHub 공식 S&P 500 CSV 백업 소스로 100% 동기화."""
     init_db()
     universe_df = pd.DataFrame()
 
-    # 1순위: Wikipedia
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         tables = pd.read_html(url, storage_options={"User-Agent": "Mozilla/5.0"})
@@ -111,7 +114,6 @@ def sync_sp500_universe() -> pd.DataFrame:
         })
     except Exception as e1:
         print(f"[Wikipedia 동기화 우회 -> 백업 CSV 사용] {e1}", flush=True)
-        # 2순위: GitHub Datasets S&P 500 CSV
         backup_url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
         raw_df = pd.read_csv(backup_url)
         universe_df = pd.DataFrame({
@@ -183,23 +185,37 @@ def _format_money(val) -> str:
 
 
 def _fetch_fundamentals(ticker: str) -> dict:
-    """실제 재무제표·현금흐름표에서 Owner's Earnings(FCF-SBC), GAAP OPM, 순부채/EBITDA 추출."""
+    """curl_cffi 브라우저 위장 세션 + yfinance를 결합해 분할 반영 주가 및 재무 팩트 추출."""
     try:
+        from curl_cffi import requests as cffi_requests
+        session = cffi_requests.Session(impersonate="chrome")
+        tk = yf.Ticker(ticker, session=session)
+    except Exception:
         tk = yf.Ticker(ticker)
+
+    try:
         info = tk.info or {}
-        # 1순위: info의 실제 시장가 / 전일종가
+
+        mcap_raw = info.get("marketCap")
+        shares_raw = info.get("sharesOutstanding")
+
+        # 1순위: info의 실제 시장가 / 전일종가 (액면분할 자동 반영)
         price_raw = (
             info.get("currentPrice")
             or info.get("regularMarketPrice")
             or info.get("previousClose")
         )
-        shares_raw = info.get("sharesOutstanding")
-        # 2순위: 시가총액 / 발행주식수 역산 (액면분할 100% 반영)
-        if not isinstance(price_raw, (int, float)) and isinstance(mcap_raw, (int, float)) and isinstance(shares_raw, (int, float)) and shares_raw > 0:
+        # 2순위: 시가총액 / 발행주식수 역산
+        if (
+            not isinstance(price_raw, (int, float))
+            and isinstance(mcap_raw, (int, float))
+            and isinstance(shares_raw, (int, float))
+            and shares_raw > 0
+        ):
             price_raw = mcap_raw / shares_raw
 
         current_price = round(float(price_raw), 2) if isinstance(price_raw, (int, float)) and price_raw > 0 else 0.0
-        mcap_raw = info.get("marketCap")
+
         per_raw = info.get("trailingPE") or info.get("forwardPE")
         ev_ebitda_raw = info.get("enterpriseToEbitda")
         fcf_raw = info.get("freeCashflow")
@@ -236,6 +252,7 @@ def _fetch_fundamentals(ticker: str) -> dict:
             net_debt_ebitda = round(net_debt / ebitda_raw, 2)
 
         return {
+            "current_price": current_price,
             "market_cap": _format_money(mcap_raw),
             "per": round(float(per_raw), 2) if isinstance(per_raw, (int, float)) else None,
             "ev_ebitda": round(float(ev_ebitda_raw), 2) if isinstance(ev_ebitda_raw, (int, float)) else None,
@@ -248,10 +265,10 @@ def _fetch_fundamentals(ticker: str) -> dict:
             "rev_growth_pct": round(float(rev_growth) * 100, 1) if isinstance(rev_growth, (int, float)) else None,
             "net_debt_str": _format_money(net_debt),
             "net_debt_ebitda": net_debt_ebitda,
-            "current_price": current_price,
         }
     except Exception:
         return {
+            "current_price": 0.0,
             "market_cap": "N/A",
             "per": None,
             "ev_ebitda": None,
@@ -264,8 +281,62 @@ def _fetch_fundamentals(ticker: str) -> dict:
             "rev_growth_pct": None,
             "net_debt_str": "N/A",
             "net_debt_ebitda": None,
-            "current_price": 0.0,
         }
+
+
+def _fetch_fallback_price(ticker: str) -> tuple[float, float]:
+    """curl_cffi 브라우저 위장으로 Yahoo v8 Chart -> Finviz -> Google Finance 순으로 실제 종가 조회."""
+    try:
+        from curl_cffi import requests as cffi_requests
+        s = cffi_requests.Session(impersonate="chrome")
+
+        # 1차: Yahoo v8 Chart (curl_cffi Chrome TLS 위장)
+        try:
+            r = s.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=5d&interval=1d", timeout=8)
+            if r.status_code == 200:
+                res = r.json()["chart"]["result"][0]
+                meta_price = res["meta"].get("regularMarketPrice")
+                closes = [c for c in res["indicators"]["quote"][0]["close"] if c is not None]
+                curr = float(meta_price) if meta_price else (float(closes[-1]) if closes else 0.0)
+                prev = float(closes[0]) if len(closes) > 1 else curr
+                chg = ((curr - prev) / prev * 100) if prev else 0.0
+                if curr > 0:
+                    return round(curr, 2), round(chg, 2)
+        except Exception:
+            pass
+
+        # 2차: Finviz 스크리너 HTML
+        if "." not in ticker:
+            try:
+                r = s.get(f"https://finviz.com/quote.ashx?t={ticker}", timeout=8)
+                if r.status_code == 200:
+                    m_price = re.search(r'class="quote-price_wrapper_price"[^>]*>([0-9,.]+)<', r.text)
+                    if not m_price:
+                        m_price = re.search(r'"price"\s*:\s*([0-9.]+)', r.text)
+                    if m_price:
+                        curr = float(m_price.group(1).replace(",", ""))
+                        if curr > 0:
+                            return round(curr, 2), 0.0
+            except Exception:
+                pass
+
+        # 3차: Google Finance HTML
+        if "." not in ticker:
+            for exch in ["NASDAQ", "NYSE"]:
+                try:
+                    r = s.get(f"https://www.google.com/finance/quote/{ticker}:{exch}", timeout=8)
+                    if r.status_code == 200:
+                        m_price = re.search(r'data-last-price="([0-9.]+)"', r.text)
+                        if m_price:
+                            curr = float(m_price.group(1))
+                            if curr > 0:
+                                return round(curr, 2), 0.0
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return 0.0, 0.0
 
 
 def _extract_json(text: str) -> dict:
@@ -275,7 +346,8 @@ def _extract_json(text: str) -> dict:
     if start != -1 and end != -1 and end > start:
         cleaned = cleaned[start:end + 1]
     return json.loads(cleaned)
-   
+
+
 def run_ai_pipeline_once(
     limit: int = 20,
     target_sector: str | None = None,
@@ -321,17 +393,26 @@ def run_ai_pipeline_once(
         close_price = p_info["close"]
         chg_5d = p_info["chg_5d"]
         fund = _fetch_fundamentals(ticker)
-        if close_price <= 0 and fund.get("current_price", 0.0) > 0:
+
+        # 1순위: curl_cffi + tk.info에서 추출한 액면분할 반영 주가
+        if fund.get("current_price", 0.0) > 0:
             close_price = fund["current_price"]
+
+        # 2순위: Yahoo v8 / Finviz / Google Finance (curl_cffi Chrome TLS 위장) 백업 조회
+        if close_price <= 0:
+            fb_price, fb_chg = _fetch_fallback_price(ticker)
+            if fb_price > 0:
+                close_price = fb_price
+                chg_5d = fb_chg
 
         user_prompt = f"""
 분석 대상 기업: {company} (티커: {ticker})
 S&P GICS 공식 섹터 분류: {sector}
-야후 파이낸스 조회 종가: {close_price} (최근 5거래일 등락률: {chg_5d:+.2f}%)
-※ 반드시 실시간 웹 검색(Google Search)으로 2026년 11월 현재 {ticker}의 액면분할(예: 10:1 분할 등)이 반영된 실제 거래 주가와 최신 10-K/10-Q 재무 수치를 확인한 뒤 목표주가를 계산하세요.
 최근 종가 (액면분할 반영 실제 시장가): ${close_price} (최근 5거래일 등락률: {chg_5d:+.2f}%)
-※ 중요: 현재 실제 주가는 반드시 ${close_price}입니다. 시가총액({fund['market_cap']})과 현재 주가(${close_price})를 기준으로 Bear/Base/Bull 목표주가를 산출하세요. 과거 액면분할 전 주가(예: 800달러대)를 절대 사용하지 마십시오.
-[야후 파이낸스 보조 재무 팩트]
+※ 중요: 현재 실제 주가는 ${close_price}입니다. 시가총액({fund['market_cap']})과 현재 주가를 기준으로 Bear/Base/Bull 목표주가를 산출하세요.
+※ 참고: Netflix(NFLX) 등 주요 대형주는 2025~2026년 액면분할을 완료하여 현재 50~150달러대에서 거래됩니다. 만약 조회 종가가 0.0이라면 반드시 Google Search로 오늘자 분할 반영 주가를 확인하세요.
+
+[실제 재무 · 현금흐름 · Owner's Earnings 팩트]
 - 시가총액: {fund['market_cap']}
 - 보고 FCF (잉여현금흐름): {fund['fcf_str']} (FCF Yield: {f"{fund['fcf_yield']}%" if fund['fcf_yield'] is not None else 'N/A'})
 - 주식보상비용 (SBC): {fund['sbc_str']}
@@ -361,51 +442,62 @@ S&P GICS 공식 섹터 분류: {sector}
                         break
                 except Exception as api_e:
                     last_err = api_e
-                    # Search 할당량/지원 문제 시 일반 모드로 1회 폴백
-                    try:
-                        res = client.models.generate_content(
-                            model=m_try,
-                            contents=user_prompt,
-                            config=types.GenerateContentConfig(
-                                system_instruction=SYSTEM_ANALYST_PROMPT,
-                                response_mime_type="application/json",
-                                temperature=0.2,
-                            ),
-                        )
-                        if res and res.text:
-                            break
-                    except Exception as e2:
-                        last_err = e2
-                        time.sleep(1.5)
-                        continue
+                    # 이미 정확한 시세(close_price > 0)를 확보한 경우에만 일반 JSON 폴백 허용
+                    if close_price > 0:
+                        try:
+                            res = client.models.generate_content(
+                                model=m_try,
+                                contents=user_prompt,
+                                config=types.GenerateContentConfig(
+                                    system_instruction=SYSTEM_ANALYST_PROMPT,
+                                    response_mime_type="application/json",
+                                    temperature=0.2,
+                                ),
+                            )
+                            if res and res.text:
+                                break
+                        except Exception as e2:
+                            last_err = e2
+                    time.sleep(1.5)
+                    continue
 
             if not res or not res.text:
-                raise last_err or RuntimeError("사용 가능한 Flash 모델 할당량이 일시 소진되었습니다.") 
+                raise last_err or RuntimeError("사용 가능한 Flash 모델 할당량이 일시 소진되었거나 Google Search가 차단되었습니다.")
+
             parsed = _extract_json(res.text)
 
-            # 야후 파이낸스가 0.0을 반환했거나 분할 전 주가인 경우 검색된 실제 주가로 보정
-            searched_price = parsed.get("actual_close_price")
-            if isinstance(searched_price, (int, float)) and searched_price > 0:
-                if close_price <= 0 or abs(close_price - searched_price) / searched_price > 0.5:
+            # API/크롤러로 시세를 못 가져온 경우(0.0)에만 AI 검색 주가로 보정
+            if close_price <= 0:
+                searched_price = parsed.get("actual_close_price") or parsed.get("close_price")
+                if isinstance(searched_price, (int, float)) and searched_price > 0:
                     close_price = round(float(searched_price), 2)
 
+            if close_price <= 0:
+                raise RuntimeError(f"{company} ({ticker})의 실제 주가 조회에 실패했습니다(0.00). 잠시 후 다시 시도해 주세요.")
+
+            raw_score = parsed.get("score")
+            score_val = int(raw_score) if isinstance(raw_score, (int, float)) and raw_score > 0 else 65
+
             bear_t = float(parsed.get("bear_target") or round(close_price * 0.85, 2))
-            base_t = float(parsed.get("base_target") or round(close_price * 1.10, 2))
-            bull_t = float(parsed.get("bull_target") or round(close_price * 1.30, 2))
+            base_t = float(parsed.get("base_target") or round(close_price * 1.12, 2))
+            bull_t = float(parsed.get("bull_target") or round(close_price * 1.35, 2))
+
+            # 혹시 AI가 10:1 액면분할 전 가격을 출력한 경우 현재가 스케일로 자동 보정
             if close_price > 0 and base_t > close_price * 4:
                 ratio = round(base_t / close_price)
                 if ratio >= 5:
                     bear_t = round(bear_t / ratio, 2)
                     base_t = round(base_t / ratio, 2)
                     bull_t = round(bull_t / ratio, 2)
-            upside_pct = round(((base_t - close_price) / close_price * 100), 2) if close_price > 0 else 0.0
+
+            upside_pct = round(((base_t - close_price) / close_price * 100), 2)
 
             insert_analysis({
                 "company": company,
                 "ticker": ticker,
                 "sector": sector,
                 "close_price": close_price,
-                "score": int(parsed.get("score", 50)),
+                "score": score_val,
                 "opinion": parsed.get("opinion", "중립"),
                 "valuation_metric": parsed.get("valuation_metric", ""),
                 "summary": parsed.get("summary", ""),
@@ -446,3 +538,4 @@ if __name__ == "__main__":
     scheduler = BlockingScheduler(timezone="Asia/Seoul")
     scheduler.add_job(lambda: run_ai_pipeline_once(limit=550), "cron", hour=16, minute=30)
     scheduler.start()
+    
