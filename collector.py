@@ -52,6 +52,13 @@ SYSTEM_ANALYST_PROMPT = """
 반드시 아래 JSON 스키마로만 응답하십시오:
 {
   "actual_close_price": 액면분할이 반영된 2026년 현재 실제 주가 숫자(소수점 2자리),
+  "market_cap": "시가총액 문자열 (예: $250.40B, 제공값이 N/A면 웹 검색으로 실제 시가총액 기입)",
+  "per": 후행 또는 선행 PER 숫자(예: 28.5, 없으면 null),
+  "ev_ebitda": EV/EBITDA 배수 숫자(예: 21.4, 없으면 null),
+  "fcf_yield": FCF Yield 백분율 숫자(예: 3.45, 없으면 null),
+  "oe_yield": Owner's Earnings(FCF-SBC) Yield 백분율 숫자(예: 3.10, 없으면 null),
+  "gaap_opm": GAAP 영업이익률 백분율 숫자(예: 27.8, 없으면 null),
+  "net_debt_ebitda": 순부채/EBITDA 배수 숫자(순현금이면 음수 예: -0.45, 없으면 null),
   "score": 1~100 사이 정수,
   "opinion": "강력매수" | "매수" | "중립" | "매도",
   "valuation_metric": "주 평가법 및 핵심 배수 (예: OE DCF [성장 15%/할인 9.5%/g 3.0%] 또는 EV/EBITDA 5.25x)",
@@ -184,8 +191,77 @@ def _format_money(val) -> str:
     return f"{sign}${abs_v:,.0f}"
 
 
+def _fetch_finviz_fundamentals(ticker: str) -> dict:
+    """yfinance 차단 시 Finviz 스냅샷 테이블에서 시가총액, PER, GAAP OPM, 매출성장률 백업 파싱."""
+    res = {}
+    if "." in ticker:
+        return res
+    try:
+        from curl_cffi import requests as cffi_requests
+        s = cffi_requests.Session(impersonate="chrome")
+        r = s.get(f"https://finviz.com/quote.ashx?t={ticker}", timeout=8)
+        if r.status_code != 200:
+            return res
+        html = r.text
+
+        def _grab(label: str) -> str | None:
+            m = re.search(rf">{re.escape(label)}</td>\s*<td[^>]*>(?:<[^>]+>)*([^<]+)", html)
+            return m.group(1).strip() if m else None
+
+        mcap = _grab("Market Cap")
+        if mcap and mcap != "-":
+            res["market_cap"] = f"${mcap}" if not mcap.startswith("$") else mcap
+
+        pe = _grab("P/E")
+        if pe and pe != "-":
+            try:
+                res["per"] = round(float(pe.replace(",", "")), 2)
+            except Exception:
+                pass
+
+        opm = _grab("Oper. Margin")
+        if opm and opm != "-":
+            try:
+                res["gaap_opm"] = round(float(opm.replace("%", "").replace(",", "")), 1)
+            except Exception:
+                pass
+
+        sales_yy = _grab("Sales Y/Y") or _grab("Sales Q/Q")
+        if sales_yy and sales_yy != "-":
+            try:
+                res["rev_growth_pct"] = round(float(sales_yy.replace("%", "").replace(",", "")), 1)
+            except Exception:
+                pass
+
+        price_s = _grab("Price")
+        if price_s and price_s != "-":
+            try:
+                res["current_price"] = round(float(price_s.replace(",", "")), 2)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return res
+
+
 def _fetch_fundamentals(ticker: str) -> dict:
-    """curl_cffi 브라우저 위장 세션 + yfinance를 결합해 분할 반영 주가 및 재무 팩트 추출."""
+    """curl_cffi + yfinance 우선 시도 후 누락 항목은 Finviz 스냅샷에서 자동 보완."""
+    base = {
+        "current_price": 0.0,
+        "market_cap": "N/A",
+        "per": None,
+        "ev_ebitda": None,
+        "fcf_str": "N/A",
+        "sbc_str": "미확인",
+        "oe_str": "N/A",
+        "fcf_yield": None,
+        "oe_yield": None,
+        "gaap_opm": None,
+        "rev_growth_pct": None,
+        "net_debt_str": "N/A",
+        "net_debt_ebitda": None,
+    }
+
     try:
         from curl_cffi import requests as cffi_requests
         session = cffi_requests.Session(impersonate="chrome")
@@ -199,13 +275,11 @@ def _fetch_fundamentals(ticker: str) -> dict:
         mcap_raw = info.get("marketCap")
         shares_raw = info.get("sharesOutstanding")
 
-        # 1순위: info의 실제 시장가 / 전일종가 (액면분할 자동 반영)
         price_raw = (
             info.get("currentPrice")
             or info.get("regularMarketPrice")
             or info.get("previousClose")
         )
-        # 2순위: 시가총액 / 발행주식수 역산
         if (
             not isinstance(price_raw, (int, float))
             and isinstance(mcap_raw, (int, float))
@@ -214,13 +288,29 @@ def _fetch_fundamentals(ticker: str) -> dict:
         ):
             price_raw = mcap_raw / shares_raw
 
-        current_price = round(float(price_raw), 2) if isinstance(price_raw, (int, float)) and price_raw > 0 else 0.0
+        if isinstance(price_raw, (int, float)) and price_raw > 0:
+            base["current_price"] = round(float(price_raw), 2)
+
+        if mcap_raw:
+            base["market_cap"] = _format_money(mcap_raw)
 
         per_raw = info.get("trailingPE") or info.get("forwardPE")
+        if isinstance(per_raw, (int, float)):
+            base["per"] = round(float(per_raw), 2)
+
         ev_ebitda_raw = info.get("enterpriseToEbitda")
+        if isinstance(ev_ebitda_raw, (int, float)):
+            base["ev_ebitda"] = round(float(ev_ebitda_raw), 2)
+
         fcf_raw = info.get("freeCashflow")
         op_margin_raw = info.get("operatingMargins")
+        if isinstance(op_margin_raw, (int, float)):
+            base["gaap_opm"] = round(float(op_margin_raw) * 100, 1)
+
         rev_growth = info.get("revenueGrowth")
+        if isinstance(rev_growth, (int, float)):
+            base["rev_growth_pct"] = round(float(rev_growth) * 100, 1)
+
         total_debt = info.get("totalDebt") or 0
         total_cash = info.get("totalCash") or 0
         ebitda_raw = info.get("ebitda")
@@ -238,50 +328,40 @@ def _fetch_fundamentals(ticker: str) -> dict:
         except Exception:
             sbc_raw = 0.0
 
-        oe_raw = None
-        oe_yield = None
-        fcf_yield = None
-        if isinstance(fcf_raw, (int, float)) and isinstance(mcap_raw, (int, float)) and mcap_raw > 0:
-            fcf_yield = round((fcf_raw / mcap_raw) * 100, 2)
+        if sbc_raw:
+            base["sbc_str"] = _format_money(sbc_raw)
+
+        if isinstance(fcf_raw, (int, float)):
+            base["fcf_str"] = _format_money(fcf_raw)
             oe_raw = fcf_raw - sbc_raw
-            oe_yield = round((oe_raw / mcap_raw) * 100, 2)
+            base["oe_str"] = _format_money(oe_raw)
+            if isinstance(mcap_raw, (int, float)) and mcap_raw > 0:
+                base["fcf_yield"] = round((fcf_raw / mcap_raw) * 100, 2)
+                base["oe_yield"] = round((oe_raw / mcap_raw) * 100, 2)
 
-        net_debt = total_debt - total_cash
-        net_debt_ebitda = None
-        if isinstance(ebitda_raw, (int, float)) and ebitda_raw > 0:
-            net_debt_ebitda = round(net_debt / ebitda_raw, 2)
-
-        return {
-            "current_price": current_price,
-            "market_cap": _format_money(mcap_raw),
-            "per": round(float(per_raw), 2) if isinstance(per_raw, (int, float)) else None,
-            "ev_ebitda": round(float(ev_ebitda_raw), 2) if isinstance(ev_ebitda_raw, (int, float)) else None,
-            "fcf_str": _format_money(fcf_raw),
-            "sbc_str": _format_money(sbc_raw) if sbc_raw else "미확인",
-            "oe_str": _format_money(oe_raw),
-            "fcf_yield": fcf_yield,
-            "oe_yield": oe_yield,
-            "gaap_opm": round(float(op_margin_raw) * 100, 1) if isinstance(op_margin_raw, (int, float)) else None,
-            "rev_growth_pct": round(float(rev_growth) * 100, 1) if isinstance(rev_growth, (int, float)) else None,
-            "net_debt_str": _format_money(net_debt),
-            "net_debt_ebitda": net_debt_ebitda,
-        }
+        if total_debt or total_cash:
+            net_debt = total_debt - total_cash
+            base["net_debt_str"] = _format_money(net_debt)
+            if isinstance(ebitda_raw, (int, float)) and ebitda_raw > 0:
+                base["net_debt_ebitda"] = round(net_debt / ebitda_raw, 2)
     except Exception:
-        return {
-            "current_price": 0.0,
-            "market_cap": "N/A",
-            "per": None,
-            "ev_ebitda": None,
-            "fcf_str": "N/A",
-            "sbc_str": "미확인",
-            "oe_str": "N/A",
-            "fcf_yield": None,
-            "oe_yield": None,
-            "gaap_opm": None,
-            "rev_growth_pct": None,
-            "net_debt_str": "N/A",
-            "net_debt_ebitda": None,
-        }
+        pass
+
+    # yfinance에서 핵심 재무가 N/A로 빠졌으면 Finviz 백업으로 보충
+    if base["market_cap"] == "N/A" or base["gaap_opm"] is None or base["current_price"] <= 0:
+        fv = _fetch_finviz_fundamentals(ticker)
+        if base["current_price"] <= 0 and fv.get("current_price", 0) > 0:
+            base["current_price"] = fv["current_price"]
+        if base["market_cap"] == "N/A" and fv.get("market_cap"):
+            base["market_cap"] = fv["market_cap"]
+        if base["per"] is None and fv.get("per") is not None:
+            base["per"] = fv["per"]
+        if base["gaap_opm"] is None and fv.get("gaap_opm") is not None:
+            base["gaap_opm"] = fv["gaap_opm"]
+        if base["rev_growth_pct"] is None and fv.get("rev_growth_pct") is not None:
+            base["rev_growth_pct"] = fv["rev_growth_pct"]
+
+    return base
 
 
 def _fetch_fallback_price(ticker: str) -> tuple[float, float]:
@@ -339,6 +419,20 @@ def _fetch_fallback_price(ticker: str) -> tuple[float, float]:
     return 0.0, 0.0
 
 
+def _to_float_or_none(val):
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return round(float(val), 2)
+    if isinstance(val, str):
+        cleaned = val.replace("%", "").replace("x", "").replace("$", "").replace(",", "").strip()
+        try:
+            return round(float(cleaned), 2)
+        except Exception:
+            return None
+    return None
+
+
 def _extract_json(text: str) -> dict:
     cleaned = text.strip()
     start = cleaned.find("{")
@@ -394,11 +488,9 @@ def run_ai_pipeline_once(
         chg_5d = p_info["chg_5d"]
         fund = _fetch_fundamentals(ticker)
 
-        # 1순위: curl_cffi + tk.info에서 추출한 액면분할 반영 주가
         if fund.get("current_price", 0.0) > 0:
             close_price = fund["current_price"]
 
-        # 2순위: Yahoo v8 / Finviz / Google Finance (curl_cffi Chrome TLS 위장) 백업 조회
         if close_price <= 0:
             fb_price, fb_chg = _fetch_fallback_price(ticker)
             if fb_price > 0:
@@ -409,10 +501,9 @@ def run_ai_pipeline_once(
 분석 대상 기업: {company} (티커: {ticker})
 S&P GICS 공식 섹터 분류: {sector}
 최근 종가 (액면분할 반영 실제 시장가): ${close_price} (최근 5거래일 등락률: {chg_5d:+.2f}%)
-※ 중요: 현재 실제 주가는 ${close_price}입니다. 시가총액({fund['market_cap']})과 현재 주가를 기준으로 Bear/Base/Bull 목표주가를 산출하세요.
-※ 참고: Netflix(NFLX) 등 주요 대형주는 2025~2026년 액면분할을 완료하여 현재 50~150달러대에서 거래됩니다. 만약 조회 종가가 0.0이라면 반드시 Google Search로 오늘자 분할 반영 주가를 확인하세요.
+※ 중요: 현재 실제 주가는 ${close_price}입니다. N/A로 표시된 재무 지표(시가총액, GAAP OPM, FCF Yield, OE Yield, EV/EBITDA, 순부채/EBITDA)는 반드시 Google Search로 최신 실적·재무제표를 조회해 JSON 필드에 채워 넣으십시오.
 
-[실제 재무 · 현금흐름 · Owner's Earnings 팩트]
+[1차 수집된 재무 · 현금흐름 · Owner's Earnings 팩트]
 - 시가총액: {fund['market_cap']}
 - 보고 FCF (잉여현금흐름): {fund['fcf_str']} (FCF Yield: {f"{fund['fcf_yield']}%" if fund['fcf_yield'] is not None else 'N/A'})
 - 주식보상비용 (SBC): {fund['sbc_str']}
@@ -422,7 +513,7 @@ S&P GICS 공식 섹터 분류: {sector}
 - PER: {fund['per'] if fund['per'] is not None else 'N/A'} | EV/EBITDA: {fund['ev_ebitda'] if fund['ev_ebitda'] is not None else 'N/A'}
 - 순부채 (음수면 순현금): {fund['net_debt_str']} (순부채/EBITDA: {f"{fund['net_debt_ebitda']}x" if fund['net_debt_ebitda'] is not None else 'N/A'})
 
-위 팩트와 웹 검색 결과를 바탕으로 OE DCF 또는 업종 대체 멀티플(EV/EBITDA 등)을 선택하여 Bear/Base/Bull 목표주가와 7단계 리서치 근거를 JSON으로 출력하세요.
+위 팩트와 웹 검색 결과를 바탕으로 누락된 재무 지표 보완, OE DCF 또는 업종 대체 멀티플 선택, Bear/Base/Bull 목표주가와 7단계 리서치 근거를 JSON으로 출력하세요.
 """
         try:
             res = None
@@ -442,7 +533,6 @@ S&P GICS 공식 섹터 분류: {sector}
                         break
                 except Exception as api_e:
                     last_err = api_e
-                    # 이미 정확한 시세(close_price > 0)를 확보한 경우에만 일반 JSON 폴백 허용
                     if close_price > 0:
                         try:
                             res = client.models.generate_content(
@@ -466,7 +556,6 @@ S&P GICS 공식 섹터 분류: {sector}
 
             parsed = _extract_json(res.text)
 
-            # API/크롤러로 시세를 못 가져온 경우(0.0)에만 AI 검색 주가로 보정
             if close_price <= 0:
                 searched_price = parsed.get("actual_close_price") or parsed.get("close_price")
                 if isinstance(searched_price, (int, float)) and searched_price > 0:
@@ -475,6 +564,24 @@ S&P GICS 공식 섹터 분류: {sector}
             if close_price <= 0:
                 raise RuntimeError(f"{company} ({ticker})의 실제 주가 조회에 실패했습니다(0.00). 잠시 후 다시 시도해 주세요.")
 
+            # API/Finviz에서 N/A로 빠진 재무 지표는 AI 웹 검색 결과로 자동 보충
+            final_mcap = fund["market_cap"]
+            if (not final_mcap or final_mcap == "N/A") and parsed.get("market_cap"):
+                m_str = str(parsed["market_cap"]).strip()
+                if m_str and m_str != "N/A":
+                    final_mcap = m_str
+
+            final_per = fund["per"] if fund["per"] is not None else _to_float_or_none(parsed.get("per"))
+            final_ev_ebitda = fund["ev_ebitda"] if fund["ev_ebitda"] is not None else _to_float_or_none(parsed.get("ev_ebitda"))
+            final_fcf_yield = fund["fcf_yield"] if fund["fcf_yield"] is not None else _to_float_or_none(parsed.get("fcf_yield"))
+            final_oe_yield = fund["oe_yield"] if fund["oe_yield"] is not None else _to_float_or_none(parsed.get("oe_yield"))
+            final_gaap_opm = fund["gaap_opm"] if fund["gaap_opm"] is not None else _to_float_or_none(parsed.get("gaap_opm"))
+            final_net_debt_ebitda = (
+                fund["net_debt_ebitda"]
+                if fund["net_debt_ebitda"] is not None
+                else _to_float_or_none(parsed.get("net_debt_ebitda"))
+            )
+
             raw_score = parsed.get("score")
             score_val = int(raw_score) if isinstance(raw_score, (int, float)) and raw_score > 0 else 65
 
@@ -482,7 +589,6 @@ S&P GICS 공식 섹터 분류: {sector}
             base_t = float(parsed.get("base_target") or round(close_price * 1.12, 2))
             bull_t = float(parsed.get("bull_target") or round(close_price * 1.35, 2))
 
-            # 혹시 AI가 10:1 액면분할 전 가격을 출력한 경우 현재가 스케일로 자동 보정
             if close_price > 0 and base_t > close_price * 4:
                 ratio = round(base_t / close_price)
                 if ratio >= 5:
@@ -502,13 +608,13 @@ S&P GICS 공식 섹터 분류: {sector}
                 "valuation_metric": parsed.get("valuation_metric", ""),
                 "summary": parsed.get("summary", ""),
                 "reasoning": parsed.get("reasoning", ""),
-                "market_cap": fund["market_cap"],
-                "per": fund["per"],
-                "ev_ebitda": fund["ev_ebitda"],
-                "fcf_yield": fund["fcf_yield"],
-                "oe_yield": fund["oe_yield"],
-                "gaap_opm": fund["gaap_opm"],
-                "net_debt_ebitda": fund["net_debt_ebitda"],
+                "market_cap": final_mcap,
+                "per": final_per,
+                "ev_ebitda": final_ev_ebitda,
+                "fcf_yield": final_fcf_yield,
+                "oe_yield": final_oe_yield,
+                "gaap_opm": final_gaap_opm,
+                "net_debt_ebitda": final_net_debt_ebitda,
                 "dcf_assumptions": parsed.get("dcf_assumptions", ""),
                 "normalization_note": parsed.get("normalization_note", ""),
                 "bear_target": round(bear_t, 2),
@@ -538,4 +644,3 @@ if __name__ == "__main__":
     scheduler = BlockingScheduler(timezone="Asia/Seoul")
     scheduler.add_job(lambda: run_ai_pipeline_once(limit=550), "cron", hour=16, minute=30)
     scheduler.start()
-    
