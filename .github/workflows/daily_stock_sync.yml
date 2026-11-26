@@ -1,0 +1,35 @@
+name: Daily S&P 500 OE Research Sync
+
+on:
+  schedule:
+    # 매일 한국시간(KST) 오전 06:30 (미국 장 마감 직후, UTC 기준 전날 21:30) 자동 실행
+    - cron: '30 21 * * 1-5'
+  workflow_dispatch: # GitHub Actions 탭에서 수동 즉시 실행 버튼 활성화
+
+jobs:
+  run-collector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: 1. 저장소 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 2. Python 3.11 환경 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 3. 필수 패키지 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 4. SEC TTM 공시 & AI 리서치 파이프라인 실행
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          API_SLEEP_SEC: "4.5"
+        run: |
+          python -c "from collector import run_ai_pipeline_once; run_ai_pipeline_once(limit=40)"
