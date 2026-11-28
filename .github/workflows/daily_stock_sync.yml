@@ -22,6 +22,8 @@ jobs:
 
       - name: 3. Install dependencies
         run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: 4. Run SEC TTM and AI research pipeline
         env:
@@ -31,10 +33,11 @@ jobs:
           MAX_WORKERS: "1"
         run: |
           python -c "from collector import run_ai_pipeline_once; run_ai_pipeline_once(limit=35)"
-      - name: 5. 텔레그램 저평가 Top 5 일일 리포트 발송
+
+      - name: 5. Send Telegram daily top 5 report
         env:
-        DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python notifier.py
